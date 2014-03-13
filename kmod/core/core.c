@@ -170,6 +170,15 @@ out:
 	return ret;
 }
 
+static struct kpatch_func *get_kpatch_func(unsigned long ip)
+{
+	struct kpatch_func *f;
+
+	hash_for_each_possible(kpatch_func_hash, f, node, ip)
+		if (f->old_addr == ip)
+			return f;
+	return NULL;
+}
 
 void notrace kpatch_ftrace_handler(unsigned long ip, unsigned long parent_ip,
 				   struct ftrace_ops *op, struct pt_regs *regs)
@@ -199,6 +208,35 @@ static struct ftrace_ops kpatch_ftrace_ops __read_mostly = {
 	.flags = FTRACE_OPS_FL_SAVE_REGS,
 };
 
+/* Remove kpatch_funcs from ftrace filter */
+static int
+kpatch_remove_funcs_from_filter(struct kpatch_func *funcs, int num_funcs)
+{
+	int i, ret = 0;
+
+	for (i = 0; i < num_funcs; i++) {
+		struct kpatch_func *func = &funcs[i];
+
+		/*
+		 * If any other modules have also patched this function, don't
+		 * remove its ftrace handler.
+		 */
+		if (get_kpatch_func(func->old_addr))
+			continue;
+
+		/* Remove the ftrace handler for this function. */
+		ret = ftrace_set_filter_ip(&kpatch_ftrace_ops, func->old_addr,
+					   1, 0);
+		if (ret) {
+			printk("kpatch: can't remove ftrace filter at address "
+			       "0x%lx (%d)\n", func->old_addr, ret);
+			break;
+		}
+	}
+
+	return ret;
+}
+
 int kpatch_register(struct module *mod, struct kpatch_func *funcs,
 		    int num_funcs)
 {
@@ -211,8 +249,7 @@ int kpatch_register(struct module *mod, struct kpatch_func *funcs,
 	down(&kpatch_mutex);
 
 	for (i = 0; i < num_funcs; i++) {
-		struct kpatch_func *f, *func = &funcs[i];
-		bool found = false;
+		struct kpatch_func *func = &funcs[i];
 
 		func->mod = mod;
 
@@ -220,14 +257,7 @@ int kpatch_register(struct module *mod, struct kpatch_func *funcs,
 		 * If any other modules have also patched this function, it
 		 * already has an ftrace handler.
 		 */
-		hash_for_each_possible(kpatch_func_hash, f, node,
-				       func->old_addr) {
-			if (f->old_addr == func->old_addr) {
-				found = true;
-				break;
-			}
-		}
-		if (found)
+		if (get_kpatch_func(func->old_addr))
 			continue;
 
 		/* Add an ftrace handler for this function. */
@@ -237,7 +267,8 @@ int kpatch_register(struct module *mod, struct kpatch_func *funcs,
 			printk("kpatch: can't set ftrace filter at address "
 				"0x%lx (%d)\n",
 				func->old_addr, ret);
-			goto out;
+			num_funcs = i;
+			goto err;
 		}
 	}
 
@@ -246,7 +277,7 @@ int kpatch_register(struct module *mod, struct kpatch_func *funcs,
 		ret = register_ftrace_function(&kpatch_ftrace_ops);
 		if (ret) {
 			printk("kpatch: can't register ftrace function \n");
-			goto out;
+			goto err;
 		}
 	}
 
@@ -263,12 +294,12 @@ int kpatch_register(struct module *mod, struct kpatch_func *funcs,
 				       ret2);
 		}
 
-		goto out;
-	}
+err:
+		/* Finally rollback the ftrace filter if getting any error */
+		kpatch_remove_funcs_from_filter(funcs, num_funcs);
+	} else
+		pr_notice("loaded patch module \"%s\"\n", mod->name);
 
-	pr_notice("loaded patch module \"%s\"\n", mod->name);
-
-out:
 	up(&kpatch_mutex);
 	return ret;
 }
@@ -277,7 +308,7 @@ EXPORT_SYMBOL(kpatch_register);
 int kpatch_unregister(struct module *mod, struct kpatch_func *funcs,
 		      int num_funcs)
 {
-	int i, ret;
+	int ret;
 	struct kpatch_stop_machine_args args = {
 		.funcs = funcs,
 		.num_funcs = num_funcs,
@@ -297,36 +328,9 @@ int kpatch_unregister(struct module *mod, struct kpatch_func *funcs,
 		}
 	}
 
-	for (i = 0; i < num_funcs; i++) {
-		struct kpatch_func *f, *func = &funcs[i];
-		bool found = false;
-
-		/*
-		 * If any other modules have also patched this function, don't
-		 * remove its ftrace handler.
-		 */
-		hash_for_each_possible(kpatch_func_hash, f, node,
-				       func->old_addr) {
-			if (f->old_addr == func->old_addr) {
-				found = true;
-				break;
-			}
-		}
-		if (found)
-			continue;
-
-		/* Remove the ftrace handler for this function. */
-		ret = ftrace_set_filter_ip(&kpatch_ftrace_ops, func->old_addr,
-					   1, 0);
-		if (ret) {
-			printk("kpatch: can't remove ftrace filter at address "
-			       "0x%lx (%d)\n",
-			       func->old_addr, ret);
-			goto out;
-		}
-	}
-
-	pr_notice("unloaded patch module \"%s\"\n", mod->name);
+	ret = kpatch_remove_funcs_from_filter(funcs, num_funcs);
+	if (ret == 0)
+		pr_notice("unloaded patch module \"%s\"\n", mod->name);
 
 out:
 	up(&kpatch_mutex);
