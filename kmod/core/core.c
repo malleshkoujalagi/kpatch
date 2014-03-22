@@ -57,6 +57,13 @@ struct kpatch_backtrace_args {
 	int num_funcs, ret;
 };
 
+static atomic_t inconsistent_flag;
+static enum {
+	KPATCH_OP_NONE,
+	KPATCH_OP_PATCH,
+	KPATCH_OP_UNPATCH,
+} kpatch_operation;
+
 void kpatch_backtrace_address_verify(void *data, unsigned long address,
 				     int reliable)
 {
@@ -146,7 +153,16 @@ static int kpatch_apply_patch(void *data)
 		/* update the global list and go live */
 		hash_add(kpatch_func_hash, &func->node, func->old_addr);
 	}
-
+	/* Check if any inconsistent NMI has happened while updating */
+	if (atomic_cmpxchg(&inconsistent_flag, 0, 2) != 0) {
+		/* Failed, we have to rollback patching process */
+		for (i = 0; i < num_funcs; i++)
+			hlist_del(&funcs[i].node);
+		ret = -EBUSY;
+	} else
+		/* Succeeded, clear updating flags */
+		for (i = 0; i < num_funcs; i++)
+			funcs[i].updating = false;
 out:
 	return ret;
 }
@@ -163,8 +179,16 @@ static int kpatch_remove_patch(void *data)
 	if (ret)
 		goto out;
 
-	for (i = 0; i < num_funcs; i++)
-		hlist_del(&funcs[i].node);
+	/* Check if any inconsistent NMI has happened while updating */
+	if (atomic_cmpxchg(&inconsistent_flag, 0, 2) != 0) {
+		/* Failed, we must keep funcs on hash table */
+		for (i = 0; i < num_funcs; i++)
+			funcs[i].updating = false;
+		ret = -EBUSY;
+	} else
+		/* Succeeded, remove all updating funcs from hash table */
+		for (i = 0; i < num_funcs; i++)
+			hlist_del(&funcs[i].node);
 
 out:
 	return ret;
@@ -183,7 +207,7 @@ static struct kpatch_func *get_kpatch_func(unsigned long ip)
 void notrace kpatch_ftrace_handler(unsigned long ip, unsigned long parent_ip,
 				   struct ftrace_ops *op, struct pt_regs *regs)
 {
-	struct kpatch_func *f;
+	struct kpatch_func *func;
 
 	/*
 	 * This is where the magic happens.  Update regs->ip to tell ftrace to
@@ -194,12 +218,38 @@ void notrace kpatch_ftrace_handler(unsigned long ip, unsigned long parent_ip,
 	 * in the hash bucket.
 	 */
 	preempt_disable_notrace();
-	hash_for_each_possible(kpatch_func_hash, f, node, ip) {
-		if (f->old_addr == ip) {
-			regs->ip = f->new_addr;
-			break;
+retry:
+	func = get_kpatch_func(ip);
+	if (unlikely(kpatch_operation != KPATCH_OP_NONE)) {
+		/*
+		 * Checking for NMI inconsistency
+		 * If this can set the inconsistent_flag here, it is the NMI
+		 * which occures in updating process. In that case, we should
+		 * rollback the process.
+		 */
+		if ((!func || func->updating) && in_nmi()) {
+			if (atomic_cmpxchg(&inconsistent_flag, 0, 1) != 2) {
+				/* Inconsistency happens here, Newly added
+				 * funcs have to be ignored.
+				 */
+				if (kpatch_operation == KPATCH_OP_PATCH)
+					goto out;
+			} else {
+				/*
+				 * Here, the updating process has been finished
+				 * successfully.
+				 */
+				if (kpatch_operation == KPATCH_OP_UNPATCH)
+					goto out;
+				/* Very rare case but possible */
+				else if (!func)
+					goto retry;
+			}
 		}
 	}
+	if (func)
+		regs->ip = func->new_addr;
+out:
 	preempt_enable_notrace();
 }
 
@@ -252,6 +302,7 @@ int kpatch_register(struct module *mod, struct kpatch_func *funcs,
 		struct kpatch_func *func = &funcs[i];
 
 		func->mod = mod;
+		func->updating = true;
 
 		/*
 		 * If any other modules have also patched this function, it
@@ -281,6 +332,8 @@ int kpatch_register(struct module *mod, struct kpatch_func *funcs,
 		}
 	}
 
+	kpatch_operation = KPATCH_OP_PATCH;
+	atomic_set(&inconsistent_flag, 0);
 	/*
 	 * Idle the CPUs, verify activeness safety, and atomically make the new
 	 * functions visible to the trampoline.
@@ -300,6 +353,7 @@ err:
 	} else
 		pr_notice("loaded patch module \"%s\"\n", mod->name);
 
+	kpatch_operation = KPATCH_OP_NONE;
 	up(&kpatch_mutex);
 	return ret;
 }
@@ -308,13 +362,19 @@ EXPORT_SYMBOL(kpatch_register);
 int kpatch_unregister(struct module *mod, struct kpatch_func *funcs,
 		      int num_funcs)
 {
-	int ret;
+	int i, ret;
 	struct kpatch_stop_machine_args args = {
 		.funcs = funcs,
 		.num_funcs = num_funcs,
 	};
 
 	down(&kpatch_mutex);
+
+	/* Start unpatching operation */
+	kpatch_operation = KPATCH_OP_UNPATCH;
+	atomic_set(&inconsistent_flag, 0);
+	for (i = 0; i < num_funcs; i++)
+		funcs[i].updating = true;
 
 	ret = stop_machine(kpatch_remove_patch, &args, NULL);
 	if (ret)
@@ -333,6 +393,7 @@ int kpatch_unregister(struct module *mod, struct kpatch_func *funcs,
 		pr_notice("unloaded patch module \"%s\"\n", mod->name);
 
 out:
+	kpatch_operation = KPATCH_OP_NONE;
 	up(&kpatch_mutex);
 	return ret;
 }
